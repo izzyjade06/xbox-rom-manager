@@ -1,0 +1,39 @@
+# Xbox ROM Manager config. Paths use single quotes so backslashes work as-is.
+
+# EmuDeck: reads the same parsers EmuDeck sets up for Steam ROM Manager, so every
+# system EmuDeck supports works, with ROMs in C:\Emulation\roms\<system>.
+# Parsers for emulators that aren't installed are skipped automatically.
+[emudeck]
+enabled = true
+userdata = 'C:\Emulation\tools\userData'
+# Parser names to ignore, exactly as EmuDeck names them, for example:
+# exclude_parsers = ["Emulators - Emulators", "ESDE - EmulationStationDE"]
+exclude_parsers = []
+
+# Cover art. Each game is looked up once; games it can't find are retried only
+# if you add a SteamGridDB key later.
+[art]
+fetch = true
+# Also add art to games you added to the Xbox app by hand.
+manual_games = true
+# Free key from steamgriddb.com (account, then Preferences, then API). Without
+# one, art only comes from Steam, which covers PC games but not most ROMs.
+steamgriddb_api_key = ""
+
+# Extra systems outside EmuDeck. Add one [[system]] section per system.
+# name        - label shown in the tool's output
+# rom_folder  - folder holding the ROMs
+# extensions  - file types that count as games
+# emulator    - full path to the emulator's exe
+# arguments   - command-line arguments; {rom} is replaced with the ROM's full path
+# recursive   - optional, true to also look in subfolders
+# art_folder  - optional, folder of cover images named after the ROM file
+#               (same name as the ROM, ending in .png, .jpg or .jpeg)
+#
+# Example (remove the # signs to use it):
+# [[system]]
+# name = "Wii"
+# rom_folder = 'D:\Games\wii'
+# extensions = ["wbfs", "iso", "rvz"]
+# emulator = 'C:\Emulators\Dolphin\Dolphin.exe'
+# arguments = '-b -e "{rom}"'

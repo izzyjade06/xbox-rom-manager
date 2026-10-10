@@ -1,0 +1,6 @@
+# Personal settings (holds your SteamGridDB key) and per-machine data
+config.toml
+state.json
+backups/
+__pycache__/
+*.tmp
