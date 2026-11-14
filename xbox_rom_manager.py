@@ -23,7 +23,10 @@ import struct
 import subprocess
 import sys
 import time
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 and older: pip install tomli
+    import tomli as tomllib
 import urllib.parse
 import urllib.request
 import uuid
@@ -640,25 +643,177 @@ def remove_all(args):
     manifest = load_json(MANIFEST_PATH, empty_manifest())
     games = manifest.get("gameCache", {})
     state = load_state()
-    for game_id in state["entries"]:
+    ours = list(state["entries"]) + list(state.get("manual", {}))
+    for game_id in ours:
         if game_id in games:
             print(f"Removed: {games[game_id].get('title', game_id)}")
             remove_art(games[game_id], args.dry_run)
             del games[game_id]
         state["art"].pop(game_id, None)
-    print(f"Done. {len(state['entries'])} games removed.")
-    changed = bool(state["entries"])
+    print(f"Done. {len(ours)} games removed.")
+    changed = bool(ours)
     state["entries"] = {}
+    state["manual"] = {}
     save(manifest, state, args.dry_run, not args.no_reopen, changed)
 
 
+# ---------- add one program by hand (right-click menu) ----------
+
+MENU_FILE_TYPES = ["exefile", "batfile", "cmdfile", "lnkfile"]
+MENU_VERB = "AddToXboxLibrary"
+GENERIC_NAMES = {"game", "launcher", "start", "play", "run", "main", "app", "client", "setup", "bin", "win64", "x64", "binaries"}
+
+
+def run_powershell(script, **variables):
+    """Run a short PowerShell script with values passed through the environment, never the command line."""
+    env = dict(os.environ, **{f"XRM_{k.upper()}": str(v) for k, v in variables.items()})
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    done = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, env=env, creationflags=flags)
+    return done.stdout
+
+
+def resolve_target(path):
+    """Work out what to launch for an .exe, a .bat or .cmd file, or a shortcut. Returns (exe, arguments, title)."""
+    path = Path(path).resolve()
+    if not path.exists():
+        sys.exit(f"File not found: {path}")
+    suffix = path.suffix.lower()
+    if suffix == ".lnk":
+        lines = run_powershell("$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:XRM_LINK); "
+                               "$s.TargetPath; $s.Arguments", link=path).splitlines()
+        target = lines[0].strip() if lines else ""
+        if not target or not Path(target).exists():
+            sys.exit(f"That shortcut doesn't point at a program on this PC: {path.name}")
+        arguments = lines[1].strip() if len(lines) > 1 else ""
+        if Path(target).suffix.lower() in (".bat", ".cmd"):
+            return Path(os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")), f'/c "{target}" {arguments}'.strip(), path.stem
+        return Path(target), arguments, path.stem
+    if suffix in (".bat", ".cmd"):
+        return Path(os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")), f'/c "{path}"', path.stem
+    if suffix == ".exe":
+        # "Game.exe" or "Launcher.exe" says nothing; the folder it sits in usually has the real name.
+        title = path.stem
+        folder = path.parent
+        while normalise(title) in GENERIC_NAMES and folder != folder.parent:
+            title, folder = folder.name, folder.parent
+        return path, "", title
+    sys.exit(f"Can't add this kind of file: {path.name}. Use an .exe, .bat, .cmd or a shortcut.")
+
+
+def icon_art(exe, game_id):
+    """Save the program's own icon as its cover. Used only when no art is found online."""
+    target = IMAGES_DIR / f"xrm-{game_id.strip('{}')}.png"
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    run_powershell("Add-Type -AssemblyName System.Drawing; "
+                   "$i = [System.Drawing.Icon]::ExtractAssociatedIcon($env:XRM_EXE); "
+                   "if ($i) { $i.ToBitmap().Save($env:XRM_OUT, [System.Drawing.Imaging.ImageFormat]::Png) }",
+                   exe=exe, out=target)
+    return str(target) if target.exists() else ""
+
+
+def add_one(args):
+    if not args.path:
+        sys.exit("Say which file to add: python xbox_rom_manager.py add \"C:\\Path\\To\\Game.exe\"")
+    exe, arguments, title = resolve_target(args.path)
+    title = args.title or clean_title(title)
+    want = {"title": title, **launch_fields(exe, arguments)}
+    manifest = load_json(MANIFEST_PATH, empty_manifest())
+    games = manifest.setdefault("gameCache", {"version": 1})
+    state = load_state()
+    same = next((e for e in games.values() if isinstance(e, dict)
+                 and all(str(e.get(k, "")).lower() == want[k].lower()
+                         for k in ("installLocation", "executableName", "executableCommandArgs"))), None)
+    if same:
+        print(f"Already in your Xbox library: {same.get('title', title)}")
+        return
+    if args.dry_run:
+        print(f"Would add: {title} ({exe} {arguments})".rstrip())
+        return
+    game_id = "{" + str(uuid.uuid4()) + "}"
+    entry = {"id": game_id, "addedDate": str(int(time.time() * 1000)), **want, "imagePath": ""}
+    art_config = load_config().get("art", {})
+    key = art_config.get("steamgriddb_api_key", "").strip()
+    art_note = "no cover art found"
+    if art_config.get("fetch", True):
+        result = find_online_art(title, (["steamgriddb"] if key else []) + ["steam"], key, strict=False)
+        if result:
+            entry["imagePath"] = save_art(*result, game_id)
+            art_note = "with cover art"
+        else:
+            entry["imagePath"] = icon_art(exe, game_id)
+            if entry["imagePath"]:
+                art_note = "no cover art found online, so it uses the program's own icon"
+    games[game_id] = entry
+    for other in games.values():
+        if isinstance(other, dict):
+            other.setdefault("imagePath", "")
+    # Kept apart from ROM entries, so a later sync never removes it for "missing ROM".
+    state.setdefault("manual", {})[game_id] = str(Path(args.path).resolve())
+    state["art"][game_id] = "done"
+    print(f"Added to your Xbox library: {title}, {art_note}.")
+    save(manifest, state, False, not args.no_reopen, True)
+
+
+def menu_command():
+    # pythonw has no console window; the result is shown in a message box, which screen readers read.
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    runner = pythonw if pythonw.exists() else Path(sys.executable)
+    return f'"{runner}" "{Path(__file__).resolve()}" add "%1" --from-menu'
+
+
+def install_menu(args):
+    import winreg
+    for file_type in MENU_FILE_TYPES:
+        base = rf"Software\Classes\{file_type}\shell\{MENU_VERB}"
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base) as key:
+            winreg.SetValueEx(key, "MUIVerb", 0, winreg.REG_SZ, "Add to Xbox library")
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base + r"\command") as key:
+            winreg.SetValueEx(key, "", 0, winreg.REG_SZ, menu_command())
+    print('"Add to Xbox library" is now in the right-click menu for programs, batch files and shortcuts. '
+          "On Windows 11 it is under Show more options.")
+
+
+def uninstall_menu(args):
+    import winreg
+    for file_type in MENU_FILE_TYPES:
+        base = rf"Software\Classes\{file_type}\shell\{MENU_VERB}"
+        for sub in (base + r"\command", base):
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, sub)
+            except FileNotFoundError:
+                pass
+    print('"Add to Xbox library" was removed from the right-click menu.')
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Add emulated games to the Xbox PC app library.")
-    parser.add_argument("command", nargs="?", default="sync", choices=["sync", "list", "remove-all"])
+    commands = {"sync": sync, "list": list_games, "remove-all": remove_all, "add": add_one,
+                "install-menu": install_menu, "uninstall-menu": uninstall_menu}
+    parser = argparse.ArgumentParser(description="Add emulated games and other programs to the Xbox PC app library.")
+    parser.add_argument("command", nargs="?", default="sync", choices=list(commands))
+    parser.add_argument("path", nargs="?", help="for add: the .exe, .bat, .cmd or shortcut to add")
+    parser.add_argument("--title", help="for add: the name to show, instead of the file's name")
     parser.add_argument("--dry-run", action="store_true", help="show what would change without writing anything")
     parser.add_argument("--no-reopen", action="store_true", help="don't reopen the Xbox app afterwards")
+    parser.add_argument("--from-menu", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    {"sync": sync, "list": list_games, "remove-all": remove_all}[args.command](args)
+    if not args.from_menu:
+        commands[args.command](args)
+        return
+    # Started from the right-click menu: no console, so collect the output and show it in a message box.
+    import contextlib
+    import ctypes
+    import io
+    output = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output):
+            commands[args.command](args)
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            output.write(e.code)
+    except Exception as e:
+        output.write(f"Something went wrong: {e}")
+    ctypes.windll.user32.MessageBoxW(0, output.getvalue().strip() or "Done.", "Xbox ROM Manager", 0x40)
 
 
 if __name__ == "__main__":
