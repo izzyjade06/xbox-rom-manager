@@ -17,7 +17,7 @@ It reads the parsers EmuDeck already sets up, so if you use EmuDeck on Windows i
 ## Requirements
 
 - Windows 10 or 11 with the Xbox app, recent enough to have "Add games to library" (rolled out from March 2026).
-- Python 3.11 or newer. No extra packages needed.
+- Python 3.11 or newer, with no extra packages. Python 3.10 also works after `pip install tomli`.
 - Optional: [EmuDeck for Windows](https://www.emudeck.com/).
 - Optional: a free [SteamGridDB](https://www.steamgriddb.com/) API key for ROM cover art.
 
@@ -41,7 +41,15 @@ python xbox_rom_manager.py --dry-run    show what would change without writing a
 python xbox_rom_manager.py list         list the games this tool manages
 python xbox_rom_manager.py remove-all   remove every game this tool added (your own stay)
 python xbox_rom_manager.py --no-reopen  don't reopen the Xbox app afterwards
+python xbox_rom_manager.py add "C:\Games\Thing\Thing.exe"   add one program, batch file or shortcut, with cover art
+python xbox_rom_manager.py add "C:\...\Thing.exe" --title "The Thing"   same, with your own name for it
+python xbox_rom_manager.py install-menu     put "Add to Xbox library" in the right-click menu
+python xbox_rom_manager.py uninstall-menu   take it out again
 ```
+
+### Right-click "Add to Xbox library"
+
+After `install-menu`, right-click any program (.exe), batch file (.bat, .cmd) or shortcut and choose **Add to Xbox library** (on Windows 11 it is under "Show more options"). The game is added with cover art from SteamGridDB or Steam; if none is found, the program's own icon is used. A message box tells you what happened, so it works with screen readers. Games added this way are never removed by `sync`; `remove-all` does remove them.
 
 When it changes your library, it closes the Xbox app, writes the changes, and reopens it. Run it again whenever you add ROMs, or schedule it with Task Scheduler.
 
