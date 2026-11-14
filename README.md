@@ -45,7 +45,16 @@ python xbox_rom_manager.py add "C:\Games\Thing\Thing.exe"   add one program, bat
 python xbox_rom_manager.py add "C:\...\Thing.exe" --title "The Thing"   same, with your own name for it
 python xbox_rom_manager.py install-menu     put "Add to Xbox library" in the right-click menu
 python xbox_rom_manager.py uninstall-menu   take it out again
+python xbox_rom_manager.py add "C:\Apps\Moonlight.exe" --title "Moonlight: PC" --args "stream mypc Desktop"   add a program with arguments
+python xbox_rom_manager.py add "C:\...\Thing.exe" --art cover.png     use your own cover; --search "Name" looks under another name; --no-art skips it
+python xbox_rom_manager.py list --all       every added game, including ones you added in the Xbox app
+python xbox_rom_manager.py rename "old name" --title "New Name"
+python xbox_rom_manager.py art "name"       look for a cover again; add --search "Other Name" or --art file.png
+python xbox_rom_manager.py art --retry-all  look again for every game with no cover
+python xbox_rom_manager.py remove "name"    remove one game this tool added; --any allows ones you added yourself
 ```
+
+Games are named by title or id, and part of a title works when only one game has it. Add `--json` to any command to get the result as one JSON object, with `ok`, the messages, and the details, which is what scripts and AI assistants should use.
 
 ### Right-click "Add to Xbox library"
 

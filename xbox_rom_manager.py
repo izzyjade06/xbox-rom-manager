@@ -34,11 +34,14 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.toml"
-STATE_PATH = HERE / "state.json"
-BACKUP_DIR = HERE / "backups"
+STATE_PATH = (Path(os.environ["XRM_TEST_DIR"]) if os.environ.get("XRM_TEST_DIR") else HERE) / "state.json"
+BACKUP_DIR = (Path(os.environ["XRM_TEST_DIR"]) if os.environ.get("XRM_TEST_DIR") else HERE) / "backups"
 BACKUPS_TO_KEEP = 10
 
-LOCAL_STATE = Path(os.environ["LOCALAPPDATA"]) / "Packages" / "Microsoft.GamingApp_8wekyb3d8bbwe" / "LocalState"
+# XRM_TEST_DIR points the tool at a scratch folder instead of the real Xbox app, for testing.
+TEST_DIR = os.environ.get("XRM_TEST_DIR")
+LOCAL_STATE = (Path(TEST_DIR) / "LocalState" if TEST_DIR else
+               Path(os.environ["LOCALAPPDATA"]) / "Packages" / "Microsoft.GamingApp_8wekyb3d8bbwe" / "LocalState")
 MANIFEST_PATH = LOCAL_STATE / "ThirdPartyLibraries" / "CustomLibraryManagement" / "CustomLibraryManagement.manifest"
 IMAGES_DIR = LOCAL_STATE / "CustomLibraryManagement" / "Images"
 
@@ -491,6 +494,8 @@ def update_art(games, state, art_config, fallbacks, rom_ids, dry_run):
 # ---------- Xbox app ----------
 
 def running_xbox_processes():
+    if TEST_DIR:
+        return []
     out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True).stdout.lower()
     return [p for p in XBOX_PROCESSES if f'"{p.lower()}"' in out]
 
@@ -621,22 +626,152 @@ def sync(args):
     rom_ids = {g for g, rom in ours.items() if desired[rom]["system"] not in LAUNCHER_PARSERS}
     art_added = update_art(games, state, config.get("art", {}), fallbacks, rom_ids, args.dry_run)
 
+    RESULT.update(action="sync", added=added, updated=updated, removed=removed, art_found=art_added, managed=len(ours))
     print(f"Done. {added} added, {updated} updated, {removed} removed, art found for {art_added}. "
           f"{len(ours)} games managed in total.")
     save(manifest, state, args.dry_run, not args.no_reopen, json.dumps(manifest) != original)
 
 
+def owner_of(game_id, state):
+    """Who put an entry in the library: a ROM sync, the add command, or you in the Xbox app."""
+    if game_id in state["entries"]:
+        return "sync"
+    if game_id in state.get("manual", {}):
+        return "add"
+    return "you"
+
+
+def entries(games):
+    return {g: e for g, e in games.items() if isinstance(e, dict) and "title" in e}
+
+
+def find_entry(games, key):
+    """Find one entry by its id, its exact title, or a part of the title that only one entry has."""
+    found = entries(games)
+    if key in found:
+        return key
+    exact = [g for g, e in found.items() if e["title"].lower() == key.lower()]
+    if len(exact) == 1:
+        return exact[0]
+    loose = [g for g, e in found.items() if normalise(key) and normalise(key) in normalise(e["title"])]
+    matches = exact or loose
+    if not matches:
+        sys.exit(f"Nothing in the Xbox library matches: {key}")
+    if len(matches) > 1:
+        names = "; ".join(sorted(found[g]["title"] for g in matches))
+        sys.exit(f"More than one entry matches {key}: {names}. Use the full title or the id.")
+    return matches[0]
+
+
 def list_games(args):
     manifest = load_json(MANIFEST_PATH, empty_manifest())
-    games = manifest.get("gameCache", {})
-    ours = load_state()["entries"]
-    if not ours:
-        print("This tool hasn't added any games yet.")
+    games = entries(manifest.get("gameCache", {}))
+    state = load_state()
+    rows = []
+    for game_id, entry in sorted(games.items(), key=lambda kv: kv[1]["title"].lower()):
+        owner = owner_of(game_id, state)
+        if owner == "you" and not args.all:
+            continue
+        image = entry.get("imagePath", "")
+        rows.append({
+            "id": game_id, "title": entry["title"], "added_by": owner,
+            "program": entry.get("installLocation", "") + entry.get("executableName", ""),
+            "arguments": entry.get("executableCommandArgs", ""),
+            "art": bool(image) and Path(image).exists(),
+            "source": state["entries"].get(game_id) or state.get("manual", {}).get(game_id, ""),
+        })
+    RESULT.update(action="list", games=rows)
+    if not rows:
+        print("The Xbox library has no added games." if args.all else "This tool hasn't added any games yet.")
         return
-    for game_id, rom in ours.items():
-        title = games.get(game_id, {}).get("title", "(missing from Xbox app)")
-        print(f"{title}: {rom}")
-    print(f"{len(ours)} games.")
+    for row in rows:
+        who = {"sync": "from a ROM sync", "add": "added with this tool", "you": "added in the Xbox app"}[row["added_by"]]
+        cover = "has a cover" if row["art"] else "no cover"
+        print(f"{row['title']}: {who}, {cover}. {row['program']} {row['arguments']}".rstrip())
+    print(f"{len(rows)} games.")
+
+
+def remove_one(args):
+    if not args.path:
+        sys.exit("Say which game to remove, by title or id.")
+    manifest = load_json(MANIFEST_PATH, empty_manifest())
+    games = manifest.get("gameCache", {})
+    state = load_state()
+    game_id = find_entry(games, args.path)
+    title = games[game_id]["title"]
+    owner = owner_of(game_id, state)
+    if owner == "you" and not args.any:
+        sys.exit(f"{title} was added in the Xbox app, not by this tool. Add --any to remove it anyway.")
+    RESULT.update(action="removed", id=game_id, title=title)
+    if args.dry_run:
+        print(f"Would remove: {title}")
+        return
+    remove_art(games[game_id], False)
+    del games[game_id]
+    for part in ("entries", "manual", "art"):
+        state.get(part, {}).pop(game_id, None)
+    print(f"Removed: {title}")
+    save(manifest, state, False, not args.no_reopen, True)
+
+
+def rename_one(args):
+    if not args.path or not args.title:
+        sys.exit("Say which game, and the new name with --title.")
+    manifest = load_json(MANIFEST_PATH, empty_manifest())
+    games = manifest.get("gameCache", {})
+    game_id = find_entry(games, args.path)
+    old = games[game_id]["title"]
+    RESULT.update(action="renamed", id=game_id, title=args.title, was=old)
+    if args.dry_run:
+        print(f"Would rename {old} to {args.title}")
+        return
+    games[game_id]["title"] = args.title
+    print(f"Renamed {old} to {args.title}")
+    save(manifest, load_state(), False, not args.no_reopen, True)
+
+
+def art_one(args):
+    """Give one game a cover: from a file, or by searching again, optionally under another name."""
+    manifest = load_json(MANIFEST_PATH, empty_manifest())
+    games = manifest.get("gameCache", {})
+    state = load_state()
+    if args.retry_all:
+        targets = [g for g, e in entries(games).items() if not (e.get("imagePath") and Path(e["imagePath"]).exists())]
+    elif args.path:
+        targets = [find_entry(games, args.path)]
+    else:
+        sys.exit("Say which game, by title or id, or use --retry-all for every game without a cover.")
+    art_config = load_config().get("art", {})
+    key = art_config.get("steamgriddb_api_key", "").strip()
+    sources = (["steamgriddb"] if key else []) + ["steam"]
+    done, missed = [], []
+    for game_id in targets:
+        entry = games[game_id]
+        if args.dry_run:
+            print(f"Would look for a cover: {entry['title']}")
+            continue
+        if args.art:
+            art = Path(args.art)
+            if not art.is_file():
+                sys.exit(f"Cover image not found: {art}")
+            result = (art.read_bytes(), art.suffix.lower())
+        else:
+            # Asked for by name, so the closest match is accepted, unlike the automatic pass in sync.
+            result = find_online_art(args.search or clean_title(entry["title"]), sources, key, strict=False)
+        if result:
+            entry["imagePath"] = save_art(*result, game_id)
+            state["art"][game_id] = "done"
+            done.append(entry["title"])
+            print(f"Cover set: {entry['title']}")
+        else:
+            state["art"][game_id] = "+".join(sources)
+            missed.append(entry["title"])
+            print(f"No cover found: {entry['title']}")
+    RESULT.update(action="art", set=done, not_found=missed)
+    if args.dry_run:
+        return
+    print(f"{len(done)} covers set, {len(missed)} not found.")
+    save(manifest, state, False, not args.no_reopen, bool(done))
 
 
 def remove_all(args):
@@ -716,6 +851,8 @@ def add_one(args):
     if not args.path:
         sys.exit("Say which file to add: python xbox_rom_manager.py add \"C:\\Path\\To\\Game.exe\"")
     exe, arguments, title = resolve_target(args.path)
+    if args.args is not None:
+        arguments = args.args
     title = args.title or clean_title(title)
     want = {"title": title, **launch_fields(exe, arguments)}
     manifest = load_json(MANIFEST_PATH, empty_manifest())
@@ -726,6 +863,7 @@ def add_one(args):
                          for k in ("installLocation", "executableName", "executableCommandArgs"))), None)
     if same:
         print(f"Already in your Xbox library: {same.get('title', title)}")
+        RESULT.update(action="already-there", id=same.get("id"), title=same.get("title"))
         return
     if args.dry_run:
         print(f"Would add: {title} ({exe} {arguments})".rstrip())
@@ -735,8 +873,16 @@ def add_one(args):
     art_config = load_config().get("art", {})
     key = art_config.get("steamgriddb_api_key", "").strip()
     art_note = "no cover art found"
-    if art_config.get("fetch", True):
-        result = find_online_art(title, (["steamgriddb"] if key else []) + ["steam"], key, strict=False)
+    if args.art:
+        art = Path(args.art)
+        if not art.is_file():
+            sys.exit(f"Cover image not found: {art}")
+        entry["imagePath"] = save_art(art.read_bytes(), art.suffix.lower(), game_id)
+        art_note = "with the cover you gave"
+    elif args.no_art:
+        art_note = "with no cover art, as asked"
+    elif art_config.get("fetch", True):
+        result = find_online_art(args.search or title, (["steamgriddb"] if key else []) + ["steam"], key, strict=False)
         if result:
             entry["imagePath"] = save_art(*result, game_id)
             art_note = "with cover art"
@@ -752,6 +898,7 @@ def add_one(args):
     state.setdefault("manual", {})[game_id] = str(Path(args.path).resolve())
     state["art"][game_id] = "done"
     print(f"Added to your Xbox library: {title}, {art_note}.")
+    RESULT.update(action="added", id=game_id, title=title, art=bool(entry["imagePath"]))
     save(manifest, state, False, not args.no_reopen, True)
 
 
@@ -786,17 +933,55 @@ def uninstall_menu(args):
     print('"Add to Xbox library" was removed from the right-click menu.')
 
 
+# What the last command did, for --json. Commands fill it in as they go.
+RESULT = {}
+
+
+def run_json(command, args):
+    """Run a command with its talk captured, then print one JSON object: ok, messages, and the details."""
+    import contextlib
+    import io
+    output = io.StringIO()
+    ok, error = True, ""
+    try:
+        with contextlib.redirect_stdout(output):
+            command(args)
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            ok, error = False, e.code if isinstance(e.code, str) else f"exit code {e.code}"
+    except Exception as e:
+        ok, error = False, f"{type(e).__name__}: {e}"
+    report = {"ok": ok, "messages": [line for line in output.getvalue().splitlines() if line.strip()], **RESULT}
+    if error:
+        report["error"] = error
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    sys.exit(0 if ok else 1)
+
+
 def main():
     commands = {"sync": sync, "list": list_games, "remove-all": remove_all, "add": add_one,
+                "remove": remove_one, "rename": rename_one, "art": art_one,
                 "install-menu": install_menu, "uninstall-menu": uninstall_menu}
-    parser = argparse.ArgumentParser(description="Add emulated games and other programs to the Xbox PC app library.")
+    parser = argparse.ArgumentParser(
+        description="Add emulated games and other programs to the Xbox PC app library.",
+        epilog="Games are named by title or id. Part of a title works when only one game has it.")
     parser.add_argument("command", nargs="?", default="sync", choices=list(commands))
-    parser.add_argument("path", nargs="?", help="for add: the .exe, .bat, .cmd or shortcut to add")
-    parser.add_argument("--title", help="for add: the name to show, instead of the file's name")
+    parser.add_argument("path", nargs="?", help="add: the .exe, .bat, .cmd or shortcut. remove, rename, art: the game's title or id")
+    parser.add_argument("--title", help="add: the name to show. rename: the new name")
+    parser.add_argument("--args", help="add: arguments to start the program with, such as a server to connect to")
+    parser.add_argument("--art", help="add, art: use this image file as the cover")
+    parser.add_argument("--search", help="add, art: look for the cover under this name instead of the title")
+    parser.add_argument("--no-art", action="store_true", help="add: don't look for a cover")
+    parser.add_argument("--retry-all", action="store_true", help="art: look again for every game that has no cover")
+    parser.add_argument("--all", action="store_true", help="list: include games you added in the Xbox app yourself")
+    parser.add_argument("--any", action="store_true", help="remove: allow removing a game that this tool didn't add")
+    parser.add_argument("--json", action="store_true", help="print the result as JSON, for scripts and assistants")
     parser.add_argument("--dry-run", action="store_true", help="show what would change without writing anything")
     parser.add_argument("--no-reopen", action="store_true", help="don't reopen the Xbox app afterwards")
     parser.add_argument("--from-menu", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.json:
+        run_json(commands[args.command], args)
     if not args.from_menu:
         commands[args.command](args)
         return
